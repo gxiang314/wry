@@ -20,6 +20,8 @@ use objc2_web_kit::WKOpenPanelParameters;
 use objc2_web_kit::{
   WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate,
 };
+#[cfg(target_os = "macos")]
+use objc2_web_kit::{WKNavigation, WKNavigationDelegate};
 
 use crate::{NewWindowFeatures, NewWindowResponse, WryWebView};
 
@@ -31,6 +33,8 @@ struct NewWindow {
   webview: Retained<objc2_web_kit::WKWebView>,
   #[allow(dead_code)]
   delegate: Retained<WryNSWindowDelegate>,
+  #[allow(dead_code)]
+  nav_delegate: Retained<WryPopupNavDelegate>,
 }
 
 // SAFETY: we are not using the new window at all, just dropping it on another thread
@@ -43,6 +47,66 @@ impl Drop for NewWindow {
     unsafe {
       self.webview.removeFromSuperview();
     }
+  }
+}
+
+// Application-layer heuristic (Pake fork only, not for upstream): some OAuth
+// popups post their result to `window.opener` and then strand on a provider
+// completion relay page without calling `window.close()`. Close the popup when
+// it reaches such a page. Matched on path only; extend as needed.
+#[cfg(target_os = "macos")]
+fn is_oauth_completion_relay(url: &str) -> bool {
+  const RELAY_PATHS: &[&str] = &[
+    "/gsi/transform",   // Google Identity Services
+    "/gsi/status",      // Google Identity Services
+    "/gsi/button",      // Google Identity Services
+    "/oauth2/approval", // OAuth 2.0 approval relay
+    "/broker",          // MSAL broker relay
+  ];
+  let url = url.to_ascii_lowercase();
+  RELAY_PATHS.iter().any(|path| url.contains(path))
+}
+
+#[cfg(target_os = "macos")]
+struct WryPopupNavDelegateIvars {
+  on_close: Box<dyn Fn()>,
+}
+
+#[cfg(target_os = "macos")]
+define_class!(
+  #[unsafe(super(NSObject))]
+  #[thread_kind = MainThreadOnly]
+  #[ivars = WryPopupNavDelegateIvars]
+  struct WryPopupNavDelegate;
+
+  unsafe impl NSObjectProtocol for WryPopupNavDelegate {}
+
+  unsafe impl WKNavigationDelegate for WryPopupNavDelegate {
+    #[unsafe(method(webView:didCommitNavigation:))]
+    unsafe fn did_commit(
+      &self,
+      webview: &objc2_web_kit::WKWebView,
+      _navigation: Option<&WKNavigation>,
+    ) {
+      let url = webview
+        .URL()
+        .and_then(|u| u.absoluteString())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+      if is_oauth_completion_relay(&url) {
+        (self.ivars().on_close)();
+      }
+    }
+  }
+);
+
+#[cfg(target_os = "macos")]
+impl WryPopupNavDelegate {
+  fn new(mtm: MainThreadMarker, on_close: Box<dyn Fn()>) -> Retained<Self> {
+    let delegate = mtm
+      .alloc::<WryPopupNavDelegate>()
+      .set_ivars(WryPopupNavDelegateIvars { on_close });
+    unsafe { msg_send![super(delegate), init] }
   }
 }
 
@@ -223,6 +287,13 @@ define_class!(
             // controller.
             window.setReleasedWhenClosed(false);
 
+            // Strip the opener's script handlers before reusing its
+            // configuration, or they get double-registered and abort on recent
+            // macOS. Reusing the configuration keeps `window.opener` wired.
+            let controller = configuration.userContentController();
+            controller.removeAllUserScripts();
+            controller.removeAllScriptMessageHandlers();
+
             let webview = objc2_web_kit::WKWebView::initWithFrame_configuration(
               mtm.alloc::<objc2_web_kit::WKWebView>(),
               window.frame(),
@@ -241,6 +312,13 @@ define_class!(
             );
             window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
 
+            let close_window = window.clone();
+            let nav_delegate =
+              WryPopupNavDelegate::new(mtm, Box::new(move || close_window.close()));
+            webview.setNavigationDelegate(Some(objc2::runtime::ProtocolObject::from_ref(
+              &*nav_delegate,
+            )));
+
             window.setContentView(Some(&webview));
             window.makeKeyAndOrderFront(None);
 
@@ -248,6 +326,7 @@ define_class!(
               ns_window: window,
               webview: webview.clone(),
               delegate,
+              nav_delegate,
             });
 
             Some(webview)
@@ -281,5 +360,31 @@ impl WryWebViewUIDelegate {
         new_windows: Rc::new(RefCell::new(vec![])),
       });
     unsafe { msg_send![super(delegate), init] }
+  }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+  use super::is_oauth_completion_relay;
+
+  #[test]
+  fn matches_known_completion_relays() {
+    assert!(is_oauth_completion_relay(
+      "https://accounts.google.com/gsi/transform"
+    ));
+    assert!(is_oauth_completion_relay(
+      "https://accounts.google.com/o/oauth2/approval/v2?x=1"
+    ));
+    assert!(is_oauth_completion_relay(
+      "https://login.microsoftonline.com/common/broker"
+    ));
+  }
+
+  #[test]
+  fn ignores_ordinary_pages() {
+    assert!(!is_oauth_completion_relay(
+      "https://accounts.google.com/signin/oauth/consent"
+    ));
+    assert!(!is_oauth_completion_relay("https://example.com/"));
   }
 }
